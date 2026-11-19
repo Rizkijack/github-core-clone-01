@@ -1,0 +1,9 @@
+node_modules/
+*.log
+*.tar.gz
+.env
+makefun-keypair.json
+wallet.json
+credentials
+transcripts/
+.DS_Store
