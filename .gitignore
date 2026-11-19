@@ -7,3 +7,6 @@ wallet.json
 credentials
 transcripts/
 .DS_Store
+
+# Windows test binary (Linux forge is the committed core)
+forge.exe
