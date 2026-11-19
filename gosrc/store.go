@@ -12,6 +12,8 @@ import (
 type GitObject struct {
 	Type string
 	Data []byte
+	ci   *commitInfo // cached parsed commit (zero-copy graph)
+	te   []TreeEntry // cached parsed tree entries
 }
 type TreeEntry struct{ Mode, Name, Oid string }
 type FlatEntry struct{ Mode, Oid string }
@@ -111,12 +113,38 @@ func (s *Store) deleteRepo(name string) bool {
 func (s *Store) storeObject(r *Repo, typ string, data []byte) string {
 	oid := gitOid(typ, data)
 	if _, ok := r.Objects[oid]; !ok {
-		r.Objects[oid] = &GitObject{Type: typ, Data: data}
+		obj := &GitObject{Type: typ, Data: data}
+		prepareObject(obj)
+		r.Objects[oid] = obj
 	}
 	return oid
 }
 func (s *Store) getObject(r *Repo, oid string) *GitObject {
 	return r.Objects[strings.ToLower(oid)]
+}
+
+// prepareObject pre-parses commit/tree content once at store time so hot reads never re-parse.
+func prepareObject(obj *GitObject) {
+	if obj.Type == "commit" {
+		ci := parseCommit(obj.Data)
+		obj.ci = &ci
+	} else if obj.Type == "tree" {
+		obj.te = parseTree(obj.Data)
+	}
+}
+
+// objCommit / objTree return cached parses (pure fallback, no write -> race-free under RLock).
+func objCommit(obj *GitObject) commitInfo {
+	if obj.ci != nil {
+		return *obj.ci
+	}
+	return parseCommit(obj.Data)
+}
+func objTree(obj *GitObject) []TreeEntry {
+	if obj.te != nil {
+		return obj.te
+	}
+	return parseTree(obj.Data)
 }
 
 func parseTree(data []byte) []TreeEntry {
@@ -183,7 +211,7 @@ func (s *Store) commitTree(r *Repo, commitOid string) string {
 	if obj == nil || obj.Type != "commit" {
 		return ""
 	}
-	return parseCommit(obj.Data).Tree
+	return objCommit(obj).Tree
 }
 
 func (s *Store) flattenTree(r *Repo, treeOid, prefix string) map[string]FlatEntry {
@@ -195,7 +223,7 @@ func (s *Store) flattenTree(r *Repo, treeOid, prefix string) map[string]FlatEntr
 	if obj == nil || obj.Type != "tree" {
 		return flat
 	}
-	for _, e := range parseTree(obj.Data) {
+	for _, e := range objTree(obj) {
 		if e.Mode == "40000" {
 			for k, v := range s.flattenTree(r, e.Oid, prefix+e.Name+"/") {
 				flat[k] = v
@@ -356,7 +384,7 @@ func (s *Store) isAncestor(r *Repo, new, old string) bool {
 		}
 		obj := s.getObject(r, cur)
 		if obj != nil && obj.Type == "commit" {
-			queue = append(queue, parseCommit(obj.Data).Parents...)
+			queue = append(queue, objCommit(obj).Parents...)
 		}
 	}
 	return false
@@ -374,7 +402,7 @@ func (s *Store) ancestors(r *Repo, oid string) map[string]bool {
 		seen[cur] = true
 		obj := s.getObject(r, cur)
 		if obj != nil && obj.Type == "commit" {
-			queue = append(queue, parseCommit(obj.Data).Parents...)
+			queue = append(queue, objCommit(obj).Parents...)
 		}
 	}
 	return seen
@@ -398,7 +426,7 @@ func (s *Store) mergeBase(r *Repo, a, b string) string {
 		}
 		obj := s.getObject(r, cur)
 		if obj != nil && obj.Type == "commit" {
-			queue = append(queue, parseCommit(obj.Data).Parents...)
+			queue = append(queue, objCommit(obj).Parents...)
 		}
 	}
 	return ""

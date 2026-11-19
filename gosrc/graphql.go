@@ -506,6 +506,7 @@ var resolvers = map[string]map[string]resolverFn{
 			}
 			i.State = "closed"
 			i.UpdatedAt = trialNow()
+			invalidateIssue(i)
 			return &gqlObj{Type: "CloseIssuePayload", Data: map[string]any{"issue": &gqlObj{Type: "Issue", Data: i}}}
 		},
 		"createPullRequest": func(s *Store, d any, a map[string]any) any {
@@ -540,6 +541,7 @@ var resolvers = map[string]map[string]resolverFn{
 			}
 			c := &Comment{ID: s.id(), Body: getStr(input, "body"), CreatedAt: trialNow()}
 			i.Comments = append(i.Comments, c)
+			invalidateIssue(i)
 			return &gqlObj{Type: "AddCommentPayload", Data: map[string]any{"commentEdge": &gqlObj{Type: "IssueCommentEdge", Data: map[string]any{"node": &gqlObj{Type: "IssueComment", Data: c}}}}}
 		},
 	},

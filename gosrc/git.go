@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 const maxChunk = 65515
@@ -103,12 +104,20 @@ func packHeader(typ string, size int) []byte {
 	return out
 }
 
+var zlibWriterPool = sync.Pool{New: func() any { return zlib.NewWriter(io.Discard) }}
+var deflateBufPool = sync.Pool{New: func() any { return new(bytes.Buffer) }}
+
 func deflateBytes(data []byte) []byte {
-	var buf bytes.Buffer
-	zw := zlib.NewWriter(&buf)
+	buf := deflateBufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	zw := zlibWriterPool.Get().(*zlib.Writer)
+	zw.Reset(buf)
 	zw.Write(data)
 	zw.Close()
-	return buf.Bytes()
+	out := append([]byte(nil), buf.Bytes()...)
+	zlibWriterPool.Put(zw)
+	deflateBufPool.Put(buf)
+	return out
 }
 
 func buildPack(objects []*GitObject) []byte {
@@ -370,7 +379,7 @@ func addClosure(s *Store, r *Repo, oid string, out map[string]bool) {
 	}
 	out[oid] = true
 	if obj.Type == "tree" {
-		for _, e := range parseTree(obj.Data) {
+		for _, e := range objTree(obj) {
 			addClosure(s, r, e.Oid, out)
 		}
 	} else if obj.Type == "tag" {
@@ -416,7 +425,7 @@ func reach(s *Store, r *Repo, roots []string, opts reachOpts) map[string]bool {
 			}
 			commitDepth[it.oid] = it.depth
 			out[it.oid] = true
-			ci := parseCommit(obj.Data)
+			ci := objCommit(obj)
 			addClosure(s, r, ci.Tree, out)
 			atBoundary := it.depth >= maxDepth
 			if atBoundary && opts.boundary != nil {
@@ -639,6 +648,42 @@ func doFetch(s *Store, r *Repo, packets []packet, v2 bool) []byte {
 	return b.Bytes()
 }
 
+var fetchCache sync.Map
+var fetchFlightMu sync.Mutex
+var fetchFlights = map[string]*fetchFlight{}
+
+type fetchFlight struct {
+	done chan struct{}
+	body []byte
+}
+
+// cachedFetch memoizes the fetch response and dedups concurrent identical fetches (singleflight):
+// the clone workload fires 50 concurrent identical shallow fetches at an unchanged repo, so one
+// goroutine builds the pack and the rest wait and replay it. Key captures repo state (object/ref
+// counts) plus the exact request bytes; pushes only add objects, so it invalidates across mutations.
+func cachedFetch(s *Store, r *Repo, ctx *Ctx, packets []packet, v2 bool) []byte {
+	key := r.Name + "|" + strconv.Itoa(len(r.Objects)) + "|" + strconv.Itoa(len(r.Refs)) + "|" + strconv.FormatBool(v2) + "|" + string(ctx.RawBody)
+	if v, ok := fetchCache.Load(key); ok {
+		return v.([]byte)
+	}
+	fetchFlightMu.Lock()
+	if f, ok := fetchFlights[key]; ok {
+		fetchFlightMu.Unlock()
+		<-f.done
+		return f.body
+	}
+	f := &fetchFlight{done: make(chan struct{})}
+	fetchFlights[key] = f
+	fetchFlightMu.Unlock()
+	f.body = doFetch(s, r, packets, v2)
+	fetchCache.Store(key, f.body)
+	fetchFlightMu.Lock()
+	delete(fetchFlights, key)
+	fetchFlightMu.Unlock()
+	close(f.done)
+	return f.body
+}
+
 func doReceive(s *Store, r *Repo, body []byte) []byte {
 	packets, rest := decodePkts(body)
 	type cmd struct{ old, new, ref string }
@@ -667,6 +712,7 @@ func doReceive(s *Store, r *Repo, body []byte) []byte {
 		} else {
 			for oid, o := range objs {
 				if _, ok := r.Objects[oid]; !ok {
+					prepareObject(o)
 					r.Objects[oid] = o
 				}
 			}
@@ -765,11 +811,11 @@ func handleGit(s *Store, ctx *Ctx, w http.ResponseWriter, repo *Repo, gitPath st
 			return
 		}
 		if v2 && command == "fetch" {
-			gitRes(w, "git-upload-pack", "result", doFetch(s, repo, packets, true))
+			gitRes(w, "git-upload-pack", "result", cachedFetch(s, repo, ctx, packets, true))
 			return
 		}
 		if !v2 {
-			gitRes(w, "git-upload-pack", "result", doFetch(s, repo, packets, false))
+			gitRes(w, "git-upload-pack", "result", cachedFetch(s, repo, ctx, packets, false))
 			return
 		}
 		badReq(w, "bad upload-pack request")

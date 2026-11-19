@@ -16,6 +16,11 @@ func jsonReply(w http.ResponseWriter, status int, body any, extra map[string]str
 	if err != nil {
 		text = []byte(`{"message":"marshal error"}`)
 	}
+	jsonReplyRaw(w, status, text, extra)
+}
+
+// jsonReplyRaw writes pre-serialized JSON bytes (hot read path: skip re-marshal).
+func jsonReplyRaw(w http.ResponseWriter, status int, text []byte, extra map[string]string) {
 	h := w.Header()
 	h.Set("Content-Type", jsonType)
 	h.Set("Content-Length", strconv.Itoa(len(text)))

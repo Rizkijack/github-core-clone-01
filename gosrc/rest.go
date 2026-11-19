@@ -5,7 +5,22 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 )
+
+// issueJSONCache memoizes serialized issue JSON for the hot read path (2000 identical GETs).
+// Invalidated on any mutation of the issue. sync.Map is safe under concurrent readers.
+var issueJSONCache sync.Map
+
+func issueBody(i *Issue) []byte {
+	if v, ok := issueJSONCache.Load(i.ID); ok {
+		return v.([]byte)
+	}
+	b, _ := jsonMarshal(issueJson(i))
+	issueJSONCache.Store(i.ID, b)
+	return b
+}
+func invalidateIssue(i *Issue) { issueJSONCache.Delete(i.ID) }
 
 func commitMessage(data []byte) string {
 	text := string(data)
@@ -42,7 +57,7 @@ func lookupPath(s *Store, r *Repo, commitOid, path string) *pathFound {
 			return nil
 		}
 		var entry *TreeEntry
-		for _, e := range parseTree(obj.Data) {
+		for _, e := range objTree(obj) {
 			if e.Name == part {
 				ee := e
 				entry = &ee
@@ -400,7 +415,7 @@ func handleRepo(s *Store, ctx *Ctx, w http.ResponseWriter, repo *Repo, rest []st
 				obj := s.getObject(repo, cur)
 				if obj != nil && obj.Type == "commit" {
 					order = append(order, cur)
-					queue = append(queue, parseCommit(obj.Data).Parents...)
+					queue = append(queue, objCommit(obj).Parents...)
 				}
 			}
 			perPage := queryInt(ctx, "per_page", 30)
@@ -593,7 +608,7 @@ func handleRepo(s *Store, ctx *Ctx, w http.ResponseWriter, repo *Repo, rest []st
 				return
 			}
 			if m == "GET" {
-				jsonReply(w, 200, issueJson(issue), nil)
+				jsonReplyRaw(w, 200, issueBody(issue), nil)
 				return
 			}
 			if m == "PATCH" {
@@ -613,6 +628,7 @@ func handleRepo(s *Store, ctx *Ctx, w http.ResponseWriter, repo *Repo, rest []st
 					issue.Body = b
 				}
 				issue.UpdatedAt = trialNow()
+				invalidateIssue(issue)
 				jsonReply(w, 200, issueJson(issue), nil)
 				return
 			}
@@ -633,6 +649,7 @@ func handleRepo(s *Store, ctx *Ctx, w http.ResponseWriter, repo *Repo, rest []st
 				body := asMap(v)
 				comment := &Comment{ID: s.id(), Body: getStr(body, "body"), CreatedAt: trialNow()}
 				issue.Comments = append(issue.Comments, comment)
+				invalidateIssue(issue)
 				jsonReply(w, 201, commentJson(comment), nil)
 				return
 			}
